@@ -3,7 +3,7 @@
 # Author: Richard Howlett
 # 21/05/21
 
-VER=2.71
+VER=2.71 # will change to 2.72 when released
 PROG=${0##*/}
 
 # misc stuff
@@ -145,6 +145,8 @@ DB_COMBO_MEMORY_ARRAY[4]="1"
 # standard OS files
 SOURCES=/etc/apt/sources.list
 SECURITY_LIMITS=/etc/security/limits.conf
+NERVECENTRE_FILE_LIMITS=/etc/security/limits.d/nervecentre.conf
+XTRABACKUP_FILE_LIMITS=/etc/security/limits.d/xtrabackup.conf
 NTPCONF=/etc/ntp.conf
 CHRONYCONF=/etc/chrony/chrony.conf
 HOSTS_FILE=/etc/hosts
@@ -425,6 +427,20 @@ remove_redundant_user_accounts()
             [ -d /home/$ACCOUNT ] && deluser --remove-home $ACCOUNT >/dev/null && echo "Removed redundant user account: $ACCOUNT"
         fi
     done
+}
+
+move_open_file_limits_to_new_file()
+{
+    # if the open file limits are in the original file and not in the new file then delete from original
+    # and write out the lines to the new file. This will only be triggered once.
+    # If the lines do not exist in either then do nothing and let the healthcheck find and fix the issue.
+    FILE_LIMITS_OLD=$(grep -E "^\* (hard nofile|soft nofile) 100000$" $SECURITY_LIMITS |wc -l)
+    FILE_LIMITS_NEW=$(grep -E "^\* (hard nofile|soft nofile) 100000$" $NERVECENTRE_FILE_LIMITS 2>/dev/null |wc -l)
+    #echo "Old: $FILE_LIMITS_OLD, New: $FILE_LIMITS_NEW"
+    if [ "$FILE_LIMITS_OLD" -gt 0 -a "$FILE_LIMITS_NEW" -eq 0 ] ; then
+        sed -i '/* \(soft\|hard\) nofile/d' $SECURITY_LIMITS && \
+        echo -e "* soft nofile 100000\n* hard nofile 100000" > $NERVECENTRE_FILE_LIMITS
+    fi
 }
 
 
@@ -1324,8 +1340,8 @@ check_disk_available()
 check_open_file_limits()
 {
     $ECHO -n "Checking open file limits ... "   # 14
-    FILE_LIMITS=$(grep -E "^\* (hard nofile|soft nofile) 100000$" $SECURITY_LIMITS |wc -l)
-    if [ "$FILE_LIMITS" -eq 2 ] ; then
+    FILE_LIMITS_NEW=$(grep -E "^\* (hard nofile|soft nofile) 100000$" $NERVECENTRE_FILE_LIMITS |wc -l)
+    if [ "$FILE_LIMITS_NEW" -eq 2 ] ; then
         $ECHO "${GRN}OK - Open file limits configured${END}"
     else
         $ECHO "${YEL}Warning - Open file limits have not yet been configured${END}"
@@ -1336,10 +1352,14 @@ check_for_non_chrooted_users()
 {
     $ECHO -n "Checking for non-chrooted users ... " # 16
     declare NON_CHROOTED_ACCOUNTS
-    for ACCOUNT in $(ls /home) ; do
+#    for ACCOUNT in $(ls /home) ; do
+#    for ACCOUNT in `grep ":[0-9][0-9][0-9][0-9]:" /etc/passwd |awk -F':' '{print $1}'` ; do
+# finds accounts with UID and GID >= 1000 and looks for them in sshd_config file
+    for ACCOUNT in `grep ".*:.*:[0-9]\{4\}:[0-9]\{4\}:" $PASSWD_FILE |awk -F':' '{print $1}'` ; do
         echo $IGNORE_ACCOUNT_LIST |grep -w -q $ACCOUNT
         if [ $? -ne 0 ] ; then  # it's NOT in the ignore list
-            if [ "$(grep $ACCOUNT $PASSWD_FILE)" -a ! "$(grep -i "Match User $ACCOUNT" $SSHD_CONFIG)" ] ; then
+#            if [ "$(grep $ACCOUNT $PASSWD_FILE)" -a ! "$(grep -i "Match User $ACCOUNT" $SSHD_CONFIG)" ] ; then
+            if [ ! "$(grep -i "Match User $ACCOUNT" $SSHD_CONFIG)" ] ; then
                 AT_LEAST_ONE_PROBLEM_LINE=Y
                 NON_CHROOTED_ACCOUNTS+=( $ACCOUNT )
             fi
@@ -1355,6 +1375,33 @@ check_for_non_chrooted_users()
         (( STAT = $STAT + 1 ))
     else
         $ECHO "${GRN}OK - No non-chrooted accounts found${END}"
+        check_chrooted_users
+    fi
+}
+check_chrooted_users()
+{
+    $ECHO -n "Checking chrooted users configured correctly ... " # 16
+    declare MISCONFIGURED_CHROOTED_ACCOUNTS
+    for ACCOUNT in `grep ".*:.*:[0-9]\{4\}:[0-9]\{4\}:" $PASSWD_FILE |awk -F':' '{print $1}'` ; do
+        echo $IGNORE_ACCOUNT_LIST |grep -w -q $ACCOUNT
+        if [ $? -ne 0 ] ; then  # it's NOT in the ignore list
+            CHROOT_DIRECTORY=$(grep -A6 -i "Match User $ACCOUNT" $SSHD_CONFIG |grep -i "ChrootDirectory" |awk '{print $2}')
+            if [ "$(grep '$NCDIR' <<< $CHROOT_DIRECTORY )" ] ; then
+                AT_LEAST_ONE_PROBLEM_LINE=Y
+                MISCONFIGURED_CHROOTED_ACCOUNTS+=( $ACCOUNT )
+            fi
+        fi
+    done
+    if [ "$AT_LEAST_ONE_PROBLEM_LINE" ] ; then
+        $ECHO "${YEL}Warning - Misconfigured chrooted accounts exist: ${#MISCONFIGURED_CHROOTED_ACCOUNTS[@]} ( ${MISCONFIGURED_CHROOTED_ACCOUNTS[@]} )${END}"
+        #$ECHO "${YEL}Warning -  Misconfiguredchrooted accounts exist: ${#MISCONFIGURED_CHROOTED_ACCOUNTS[@]}${END}"    # to print users on a line of their own
+        #$ECHO "${MISCONFIGURED_CHROOTED_ACCOUNTS[@]}" |\
+        #while read LINE ; do
+        #    printf "  %s\n" "$LINE"
+        #done
+        (( STAT = $STAT + 1 ))
+    else
+        $ECHO "${GRN}OK - All chrooted accounts configured correctly${END}"
     fi
 }
 check_omi_version()
@@ -2417,10 +2464,14 @@ real_fix_health_check_problems()
 
     while read LINE ; do                            # SEE NOTE ABOVE
         case "$LINE" in
+        *Open\ file\ limits\ \(root\)*)
+            echo "Setting open file limits (root) to 100000"
+            echo -e "root soft nofile 100000\nroot hard nofile 100000" > $XTRABACKUP_FILE_LIMITS
+            (( ISSUES_FIXED = ISSUES_FIXED + 1 ))
+            ;;
         *Open\ file\ limits*)
             echo "Setting open file limits to 100000"
-            sudo sed -i '45 i * soft nofile 100000' /etc/security/limits.conf && \
-            sudo sed -i '47 i * hard nofile 100000' /etc/security/limits.conf
+            echo -e "* soft nofile 100000\n* hard nofile 100000" > $NERVECENTRE_FILE_LIMITS
             (( ISSUES_FIXED = ISSUES_FIXED + 1 ))
             ;;
         *Large\ files\ found*)
@@ -2945,6 +2996,10 @@ chmod_755_scripts
 
 # Remove some users we know are not required
 remove_redundant_user_accounts
+
+# Silently moves the open file limits lines from /etc/security/limits.conf
+# to /etc/security/limits.d/nervecentre.conf if the lines exist in /etc/security/limits.conf
+move_open_file_limits_to_new_file
 
 THIS_HOST=$(get_this_host)
 
