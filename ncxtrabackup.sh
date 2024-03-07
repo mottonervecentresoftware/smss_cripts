@@ -3,7 +3,7 @@
 # Richard Howlett
 # 03/11/22
 
-VER=1.20
+VER=1.20    # will change to 1.21 when released
 PROG=${0##*/}
 
 # misc stuff
@@ -120,6 +120,7 @@ ENCRYPTION_KEY_FILE=$XTRABACKUP_DIR/encryption_key
 
 GROUPS_FILE=/etc/group
 LOCALBINDIR=/usr/local/bin
+XTRABACKUP_FILE_LIMITS=/etc/security/limits.d/xtrabackup.conf
 
 check_mirror()
 {
@@ -336,6 +337,15 @@ verify_install()
         $ECHO "${GRN}OK - Permissions are correct${END}"
     else
         $ECHO "${RED}Fail - Permissions are not correct${END}"
+        (( STAT = $STAT + 1 ))
+    fi
+
+    $ECHO -n "Checking open file limits (root) ... "
+    FILE_LIMITS=$(grep -E "^root (hard nofile|soft nofile) 100000$" $XTRABACKUP_FILE_LIMITS 2>/dev/null |wc -l)
+    if [ "$FILE_LIMITS" -eq 2 ] ; then
+        $ECHO "${GRN}OK - Open file limits (root) configured${END}"
+    else
+        $ECHO "${YEL}Warning - Open file limits (root) have not yet been configured${END}"
         (( STAT = $STAT + 1 ))
     fi
 
@@ -640,6 +650,10 @@ echo "Saving encryption key ..."
 printf '%s' "$ENCRYPTION_KEY" > $ENCRYPTION_KEY_FILE
 chown backup:backup $ENCRYPTION_KEY_FILE
 chmod 600 $ENCRYPTION_KEY_FILE
+
+echo "Setting open file limits (root) to 100000 ..."
+echo -e "root soft nofile 100000\nroot hard nofile 100000" > $XTRABACKUP_FILE_LIMITS
+
 
 prepare_scripts
 
